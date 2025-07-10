@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+## [1.1.0](https://github.com/apsyadira-jubelio/go-pgx-multitenancy/compare/v1.0.0...v1.1.0) (2025-07-10)
+
+
+### Features
+
+* add pgbouncer support with disabled connection health checks and pool closing ([a743c11](https://github.com/apsyadira-jubelio/go-pgx-multitenancy/commit/a743c11dbafdedaf9986915ef0e787e655fde9c2))
+
 ## 1.0.0 (2025-07-10)
 
 ## 1.0.0 (2025-07-10)
