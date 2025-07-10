@@ -176,15 +176,8 @@ func (tm *TenantManager) GetConnection(ctx context.Context) (*TenantConn, error)
 		}
 	}
 
-	// Acquire connection from the pool
-	conn, err := pool.Acquire(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to acquire connection for host %s: %w", host, err)
-	}
-
 	// Return wrapped connection with pool reference
 	return &TenantConn{
-		Conn:      conn,
 		pool:      pool,
 		cached:    true,                   // Connection is from the cached pool
 		pgBouncer: tm.config.UsePgBouncer, // Set based on config
