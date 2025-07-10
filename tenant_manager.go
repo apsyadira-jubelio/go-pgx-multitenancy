@@ -59,6 +59,10 @@ type Config struct {
 	MaxConnectionIdleTime time.Duration
 
 	DefaultQueryExecMode pgx.QueryExecMode
+
+	// UsePgBouncer indicates that pgbouncer is being used as a connection pooler
+	// When true, connection pools won't be manually closed by the application
+	UsePgBouncer bool
 }
 
 // TenantManager manages connections for multiple tenants
@@ -96,33 +100,33 @@ func NewTenantManager(config Config) (*TenantManager, error) {
 	return tm, nil
 }
 
-// TenantConn is a wrapper around pgxpool.Conn that adds automatic pool closing
+// TenantConn is a wrapper around a connection from a connection pool
 type TenantConn struct {
 	*pgxpool.Conn
-	pool   *pgxpool.Pool
-	cached bool // Indicates if the connection is from a cached pool
+	pool      *pgxpool.Pool
+	cached    bool // Indicates if the connection is from a cached pool
+	pgBouncer bool // Indicates if pgbouncer is being used for this connection
 }
 
 // Release releases the connection back to the pool
-// If the connection is not from a cached pool, it also closes the pool
+// If UsePgBouncer is false and the connection is not from a cached pool, it also closes the pool
 func (tc *TenantConn) Release() {
-	// Check if connection is healthy before releasing
-	if tc.Conn != nil {
-		// Force the connection to complete any pending operations
-		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer cancel()
-		
-		// Try to ping the connection to verify it's healthy
-		err := tc.Conn.Ping(ctx)
-		if err != nil {
-			log.Printf("Unhealthy connection detected during release, closing forcefully: %v", err)
-		}
-		
-		// Release the connection back to the pool
-		tc.Conn.Release()
+	// Just return if the connection is nil to avoid panics
+	if tc.Conn == nil {
+		return
 	}
 
-	// Only close the pool if it's not cached
+	// Simply release the connection back to the pool
+	// Without health checks which can conflict with pgbouncer
+	tc.Conn.Release()
+
+	// When using pgbouncer, we should never close pools manually
+	// pgbouncer manages the connection lifecycle
+	if tc.pgBouncer {
+		return
+	}
+
+	// Only close the pool if it's not cached and we're not using pgbouncer
 	if !tc.cached && tc.pool != nil {
 		log.Println("Closing non-cached connection pool")
 		tc.pool.Close()
@@ -145,50 +149,46 @@ func (tm *TenantManager) GetConnection(ctx context.Context) (*TenantConn, error)
 	tm.poolMux.RUnlock()
 
 	if !exists {
-		// No existing pool, create a new one
+		// Create new pool config for this host
 		poolConfig, err := tm.getOrCreatePoolConfig(host)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create pool config for tenant %s: %w", host, err)
+			return nil, fmt.Errorf("failed to create pool config for host %s: %w", host, err)
 		}
 
-		// Create the new pool
+		// Create new connection pool
 		newPool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create connection for tenant %s: %w", host, err)
+			return nil, fmt.Errorf("failed to create connection for host %s: %w", host, err)
 		}
 
-		// Store the pool in the cache
+		// Attempt to cache the pool with thread safety
 		tm.poolMux.Lock()
-		// Check again to avoid race conditions
 		if existingPool, doubleCheck := tm.poolCache[host]; doubleCheck {
-			// Another goroutine created the pool while we were waiting for the lock
+			// Another goroutine created the pool before we did
 			tm.poolMux.Unlock()
-			// Close the pool we just created since we won't use it
 			newPool.Close()
 			pool = existingPool
 		} else {
-			// Store our newly created pool in the pool cache
+			// We're the first to create this pool, cache it
 			tm.poolCache[host] = newPool
-			pool = newPool
 			tm.poolMux.Unlock()
+			pool = newPool
 		}
 	}
 
-	// Get a connection from the pool
+	// Acquire connection from the pool
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to acquire connection for tenant %s: %w", host, err)
+		return nil, fmt.Errorf("failed to acquire connection for host %s: %w", host, err)
 	}
 
-	// Wrap the connection with our TenantConn to handle cleanup
-	// The connection is returned to the pool when released, but the pool itself remains open
-	tenantConn := &TenantConn{
-		Conn:   conn,
-		pool:   pool,
-		cached: true,
-	}
-
-	return tenantConn, nil
+	// Return wrapped connection with pool reference
+	return &TenantConn{
+		Conn:      conn,
+		pool:      pool,
+		cached:    true,                   // Connection is from the cached pool
+		pgBouncer: tm.config.UsePgBouncer, // Set based on config
+	}, nil
 }
 
 // buildDSN constructs a DSN string for the specified tenant
@@ -234,7 +234,7 @@ func (tm *TenantManager) getOrCreatePoolConfig(tenantID string) (*pgxpool.Config
 	// Set pool configuration based on TenantManager settings
 	poolConfig.MaxConns = tm.config.MaxConnectionsPerPool
 	poolConfig.MinConns = tm.config.MinConnectionsPerPool
-	
+
 	// Configure idle connection management
 	if tm.config.MaxConnectionIdleTime > 0 {
 		poolConfig.MaxConnIdleTime = tm.config.MaxConnectionIdleTime
@@ -242,26 +242,26 @@ func (tm *TenantManager) getOrCreatePoolConfig(tenantID string) (*pgxpool.Config
 		// Default to 30 seconds if not specified
 		poolConfig.MaxConnIdleTime = 30 * time.Second
 	}
-	
+
 	// Set health check interval to detect and cleanup broken connections
 	poolConfig.HealthCheckPeriod = 15 * time.Second
-	
+
 	// Set connection lifetime to recycle connections periodically
 	poolConfig.MaxConnLifetime = 5 * time.Minute
-	
+
 	// Set query execution mode
 	poolConfig.ConnConfig.DefaultQueryExecMode = tm.config.DefaultQueryExecMode
-	
+
 	// Set runtime parameters
 	poolConfig.ConnConfig.RuntimeParams = map[string]string{}
-	
+
 	// Use application name if provided, otherwise use database name
 	appName := tm.config.DefaultDSNConfig.ApplicationName
 	if appName == "" {
 		appName = tm.config.DefaultDSNConfig.Database
 	}
 	poolConfig.ConnConfig.RuntimeParams["application_name"] = appName
-	
+
 	// Set timezone if provided
 	if tm.config.DefaultDSNConfig.Timezone != "" {
 		poolConfig.ConnConfig.RuntimeParams["timezone"] = tm.config.DefaultDSNConfig.Timezone

@@ -38,6 +38,9 @@ func main() {
 		MinConnectionsPerPool: 1,
 		MaxConnectionIdleTime: 5 * time.Second,
 		DefaultQueryExecMode:  pgx.QueryExecModeDescribeExec,
+		// Set UsePgBouncer to true when using pgbouncer as your connection pooler
+		// This will disable connection health checks and pool closing
+		UsePgBouncer: true,
 	})
 
 	if err != nil {
